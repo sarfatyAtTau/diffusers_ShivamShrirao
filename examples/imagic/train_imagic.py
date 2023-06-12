@@ -319,7 +319,11 @@ def main():
     if accelerator.is_main_process:
         accelerator.init_trackers("imagic", config=vars(args))
 
-    def train_loop(pbar, optimizer, params):
+    from datetime import datetime
+    now = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    images_dir = os.path.join(args.output_dir, "images", f'{now}_seed_{args.seed}')
+
+    def train_loop(pbar, optimizer, params, infer_each_step=False):
         loss_avg = AverageMeter()
         for step in pbar:
             with accelerator.accumulate(unet):
@@ -349,6 +353,15 @@ def main():
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=step)
 
+            if infer_each_step and not step % 20:
+                infer(accelerator,
+                      unet=accelerator.unwrap_model(unet),
+                      model_path=args.pretrained_model_name_or_path,
+                      output_dir=args.output_dir,
+                      images_dir=images_dir,
+                      additional_text=f'step_{step}',
+                      seed=args.seed)
+
         accelerator.wait_for_everyone()
     
     progress_bar = tqdm(range(args.emb_train_steps), disable=not accelerator.is_local_main_process)
@@ -377,7 +390,7 @@ def main():
     progress_bar.set_description("Fine Tuning")
     unet.train()
 
-    train_loop(progress_bar, optimizer, unet.parameters())
+    train_loop(progress_bar, optimizer, unet.parameters(), infer_each_step=True)
 
     # Create the pipeline using using the trained modules and save it.
     if accelerator.is_main_process:
@@ -388,10 +401,69 @@ def main():
         )
         pipeline.save_pretrained(args.output_dir)
 
-        if args.push_to_hub:
-            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
+    if accelerator.is_main_process:
+        infer(accelerator,
+              unet=accelerator.unwrap_model(unet),
+              model_path=args.pretrained_model_name_or_path,
+              output_dir=args.output_dir,
+              images_dir=images_dir,
+              seed=args.seed)
+
 
     accelerator.end_training()
+
+
+def infer(accelerator, unet, model_path, output_dir, images_dir=None, seed=1234, additional_text=""):
+    import os
+    import torch
+    from torch import autocast
+    from diffusers import StableDiffusionPipeline, DDIMScheduler
+
+    if accelerator.is_main_process:
+        scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False,
+                                  set_alpha_to_one=False)
+        pipe = StableDiffusionPipeline.from_pretrained(
+            model_path,
+            unet=unet,
+            scheduler=scheduler,
+            use_auth_token=True,
+            torch_dtype=torch.float16).to("cuda").to(accelerator.device)
+        target_embeddings = torch.load(os.path.join(output_dir, "target_embeddings.pt")).to("cuda")
+        optimized_embeddings = torch.load(os.path.join(output_dir, "optimized_embeddings.pt")).to("cuda")
+
+        g_cuda = torch.Generator(device='cuda')
+        # g_cuda.manual_seed(seed)
+        g_cuda.manual_seed(4324)
+
+        # disable NSFW check
+        def dummy(images, **kwargs):
+            return images, False
+        pipe.safety_checker = dummy
+
+        alpha = 0.8
+        num_samples = 1
+        guidance_scale = 3
+        num_inference_steps = 50
+        height = 512
+        width = 512
+
+        edit_embeddings = alpha * target_embeddings + (1 - alpha) * optimized_embeddings
+        with autocast("cuda"), torch.inference_mode():
+            images = pipe(
+                prompt_embeds=edit_embeddings,
+                height=height,
+                width=width,
+                num_images_per_prompt=num_samples,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=g_cuda
+            ).images
+        os.makedirs(images_dir, exist_ok=True)
+        for index, img in enumerate(images):
+            img_name = f"img_{index}.png"
+            if additional_text != "":  # in case it's a per-iteration inference
+                img_name = f"{additional_text}_{img_name}"
+            img.save(os.path.join(images_dir, img_name))
 
 
 if __name__ == "__main__":
